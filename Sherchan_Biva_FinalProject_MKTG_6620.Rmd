@@ -1,0 +1,445 @@
+---
+title: "6620: Final Project"
+author: "Biva Sherchan"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+**Import and preprocess the dataset**
+```{r}
+library(tidymodels)
+library(xgboost)
+
+#Import the dataset
+OJ<-read.csv(url("http://data.mishra.us/files/project/OJ_data.csv"))
+
+#Switch the binary values of the target variable Purchase since we are interested in MM so we need MM value to be 1 rather than CH.
+OJ$Purchase <- ifelse(OJ$Purchase == 0, 1, 0)
+
+#Convert the target variable to factor and all the predictor variables to numeric.
+OJ[2:14] <- lapply(OJ[2:14], as.numeric)
+OJ$Purchase <- as.factor(OJ$Purchase)
+#OJ$SpecialCH <- as.factor(OJ$SpecialCH)
+#OJ$SpecialMM <- as.factor(OJ$SpecialMM)
+sapply(OJ,class)
+```
+
+**Check for Null values in the dataset and impute/remove as needed**
+```{r, warning=FALSE, message=FALSE}
+# Count the number of null values in each column
+null_count <- colSums(is.na(OJ))
+
+# Display the number of null values for each column
+print(null_count)
+
+# Check for missing or NA values in each column
+missing_values <- sapply(OJ, function(x) sum(is.na(x)))
+
+# Display columns with missing values
+cols_with_missing <- names(OJ)[missing_values > 0]
+
+# Print the columns with missing values
+if (length(cols_with_missing) > 0) {
+  cat("Columns with missing values:", paste(cols_with_missing, collapse = ", "), "\n")
+} else {
+  cat("No columns with missing values.\n")
+}
+```
+#There are no missing data in the dataset.
+
+**Check the distribution proportion of the target variable Purchase in the dataset for any data imbalance**
+```{r pressure, echo=FALSE}
+OJ_df_prop <- data.frame(OJ) %>% count(Purchase) %>%
+    mutate(freq=n/sum(n))
+print(OJ_df_prop)
+```
+
+# We see 61% vs 39% distribution of the target variable which is pretty balanced and does not need to be weighted.
+
+**Check for outliers using the Minimum Covariance Determinant(MCD) method.**
+```{r pressure, echo=FALSE}
+library(robustbase)
+library(chemometrics)
+library(rpart)
+vect=OJ[, c("PriceCH", "PriceMM", "DiscCH", "DiscMM", "SpecialCH", "SpecialMM", "LoyalCH", "SalePriceMM", "SalePriceCH", "PriceDiff", "PctDiscMM", "PctDiscCH", "ListPriceDiff")]
+
+#Calculate MCD. We are specifying that at least 50% of the data points must not be outliers.
+x.mcd=covMcd(vect,alpha=.5)
+#Print Mahalanobis distances
+x.mcd$
+x.mcd$mcd.wt
+# Print rows where x.mcd$mcd.wt equals 0 i.e. are distinguished as outlier
+subset(OJ, x.mcd$mcd.wt == 0)
+```
+
+# We do not see outliers in the dataset.
+
+**Split the data into training (80%) and test (20%) sets. Training set will be used to train the model and test set will be used for performance evaluation of the model**
+```{r, warning=FALSE, message=FALSE}
+set.seed(123)
+OJ_testtrn <- initial_split(OJ, prop=0.8, strata=Purchase)
+trainData <- training(OJ_testtrn)
+testData <- testing(OJ_testtrn)
+trainpredictors <- trainData[, !(names(trainData) == "Purchase")]
+```
+
+**Fit a Gradient Boosted Tree model and tune the hyperparameters to get the best model**
+```{r}
+set.seed(123)
+
+rec_OJ <- recipe(Purchase ~ ., trainData) %>% 
+  prep(training = trainData)
+
+model_OJ <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  learn_rate = tune()) %>% 
+  set_engine("xgboost", verbosity = 0) %>% 
+  set_mode("classification")
+
+hyper_grid <- grid_regular(
+  trees(),
+  tree_depth(),
+  learn_rate(),
+  levels = 4)
+
+OJ_folds <- vfold_cv(trainData, v=5)
+
+OJ_wf <- workflow() %>%
+  add_model(model_OJ) %>%
+  add_recipe(rec_OJ)
+
+# Modify the metrics for classification (e.g., accuracy, AUC, etc.)
+library(caret)
+classification_metrics <- metric_set(roc_auc)
+
+OJ_tune <- 
+  OJ_wf %>% 
+  tune_grid(
+    resamples = OJ_folds,
+    grid = hyper_grid,  # Use hyperparameters suitable for classification
+    metrics = classification_metrics  # Use classification metrics
+  ) 
+
+best_model <- OJ_tune %>%
+  select_best("roc_auc")
+
+best_model
+
+```
+# Best set of hyperparamater values are num_trees=667, tree_depth=1 and learning rate=0.1.
+
+**Create the final XGBoost model using the best hyperparameter combinations and output the metrics**
+```{r}
+final_workflow <- 
+  OJ_wf %>% 
+  finalize_workflow(best_model)
+
+final_fit <- 
+  final_workflow %>%
+  last_fit(split = OJ_testtrn) 
+
+final_fit %>%
+  collect_metrics()
+```
+
+# Accuracy rate is 80% and the ROC_AUC curve value is 0.87.
+
+**Predict and print accuracy for Logistic Regression model2**
+```{r }
+testData$predictions <- predict(final_fit$.workflow[[1]]$.fit, newdata= testData, type="response")
+testData$binary_prediction <- ifelse(testData$predictions>0.5,1,0)
+
+testData$binary_prediction <- as.factor(testData$binary_prediction)
+
+testData <- testData %>% mutate(accurate=1*(binary_prediction==Purchase))
+accuracy <- sum(testData$accurate)/nrow(testData)
+
+print(paste("Accuracy:", round(accuracy,3)))
+```
+****Confusion Matrix to calculate TPR and FPR rates for glm_model2**
+```{r }
+t(confusionMatrix(testData$binary_prediction,testData$Purchase)$table)
+confusionMatrix(testData$binary_prediction,testData$Purchase)$byClass
+```
+
+**Create VIP plot to check which variables played an important role**
+```{r}
+library(vip)
+final_workflow %>%
+  fit(data = trainData) %>%
+  extract_fit_parsnip() %>%
+  vip(geom = "point")
+```
+#LoyalCH is the most important variable and has pretty high importance. PriceDiff is the second most important variable but the importance is much lower than LoyalCH.
+
+**Create PDP plot to explore our best-fitted model response as a function of the selected predictor variables**
+```{r}
+library(DALEXtra)
+model_fitted <- final_workflow %>%
+  fit(data = trainData)
+explainer_rf <- explain_tidymodels(model_fitted, 
+                                   data = trainData[,-1],
+                                   y = trainData$Purchase, 
+                                   type = "pdp",verbose = FALSE)
+
+pdp_LoyalCH <- model_profile(explainer_rf,
+                             variables = "LoyalCH", 
+                             N=NULL)
+pdp_PriceDiff <- model_profile(explainer_rf,
+                               variables = "PriceDiff",
+                               N=NULL)
+pdp_ListPriceDiff <- model_profile(explainer_rf,
+                               variables = "ListPriceDiff",
+                               N=NULL)
+pdp_DiscCH <- model_profile(explainer_rf,
+                               variables = "DiscCH",
+                               N=NULL)
+pdp_DiscMM <- model_profile(explainer_rf,
+                               variables = "DiscMM",
+                               N=NULL)
+pdp_PriceCH <- model_profile(explainer_rf,
+                               variables = "PriceCH",
+                               N=NULL)
+pdp_PriceMM <- model_profile(explainer_rf,
+                               variables = "PriceMM",
+                               N=NULL)
+pdp_SalePriceCH <- model_profile(explainer_rf,
+                               variables = "SalePriceCH",
+                               N=NULL)
+pdp_SalePriceMM <- model_profile(explainer_rf,
+                               variables = "SalePriceMM",
+                               N=NULL)
+pdp_PctDiscMM <- model_profile(explainer_rf,
+                               variables = "PctDiscMM",
+                               N=NULL)
+pdp_PctDiscCH <- model_profile(explainer_rf,
+                               variables = "PctDiscCH",
+                               N=NULL)
+plot(pdp_LoyalCH)
+plot(pdp_PriceDiff)
+plot(pdp_ListPriceDiff)
+plot(pdp_DiscCH)
+plot(pdp_PriceCH)
+plot(pdp_DiscMM)
+plot(pdp_PriceMM)
+plot(pdp_SalePriceCH)
+plot(pdp_SalePriceMM)
+plot(pdp_PctDiscMM)
+plot(pdp_PctDiscCH)
+```
+# From the PDP we can see that PriceMM, SalePriceCH, PctDiscCH,PctDiscMM plot are flat indicating that these predictor variables do not have any effect on the target variable Purchase. However, Loyal CH has pretty linear negative relationship with the target variable Purchase which means that as the customer brand loyalty for CH i.e. probability of customer buying CH over MM increases, the probability of customer buying MM decreases.
+# We see that PriceDiff has a negative relationship as well which means that as the sale price of MM less sale price of CH increases, the probability of customer buying MM decreases.
+
+**Fit a Logistic Regression model using all the variables**
+```{r, warning=FALSE, message=FALSE}
+glm_model1 <- glm(Purchase~.,data=trainData,family=binomial(link='logit'))
+summary(glm_model1)
+```
+
+# The message "Coefficients: (4 not defined because of singularities)" indicates that the coefficients for predictor variables could not be estimated due to the presence of perfect or near-perfect multicollinearity. We will need to address the collinearity or multicollinearity issues in the dataset.
+
+**Create correlation plot to check which variables have multicollinearity**
+```{r pressure, echo=FALSE}
+predictors <- OJ[, !(names(trainData) == "Purchase")]
+correl <- cor(predictors)
+ggcorrplot::ggcorrplot(correl,hc.order=TRUE,type="lower",lab=TRUE)
+```
+# We see some perfect and some pretty high multicollinearity. Variables like DiscCH and PctDiscCH, DiscMM and PctDiscMM have a perfect collinearity with value of 1. We can also see some pretty high collinearity values between SalePriceMM, PriceDiff, DiscMM and PctDiscMM.
+
+**Run the Lasso penalized regression model for the variable selection**
+```{r, warning=FALSE, message=FALSE}
+library(glmnet)
+set.seed(123)
+predictors <- trainData[,c(2:14)]
+Purchase <- trainData$Purchase
+lasso_model <- cv.glmnet(data.matrix(predictors), 
+                         y = as.factor(Purchase),  # Assuming Purchase is a binary outcome
+                         alpha = 1, 
+                         family = "binomial",  # for logistic regression
+                         nfolds = 20, 
+                         standardize = TRUE,
+                         type.measure = "auc",  # or use "class" for accuracy
+                         nlambda = 100)
+
+plot(lasso_model)
+lasso_coef <- coef(lasso_model, s="lambda.min", exact=FALSE)
+
+#Print the Lasso Coefficients
+print(lasso_coef)
+```
+#Lasso regression model shrinked the coefficients of many predictor variables. Most of which we saw per correlation plot had multicollinarity issues like PctDiscMM, PctDiscCH to zero. We will select only the variables that Lasso did not shrink to zero i.e. DiscCH, LoyalCH, PriceDiff and ListPriceDiff for modeling. These are also 4 of the top 5 variables selected by XGBoost in VIP plot but removing SalePriceMM due to high correlation with PriceDiff.
+
+**Fit a Gradient Boosted Tree model using the selected variables and tune the hyperparameters to get the best model**
+```{r}
+set.seed(123)
+rec_OJ <- recipe(Purchase ~ DiscCH + LoyalCH + PriceDiff + ListPriceDiff, trainData) %>% 
+  prep(training = trainData)
+
+model_OJ <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  learn_rate = tune()) %>% 
+  set_engine("xgboost", verbosity = 0) %>% 
+  set_mode("classification")
+
+hyper_grid <- grid_regular(
+  trees(),
+  tree_depth(),
+  learn_rate(),
+  levels = 4)
+
+OJ_folds <- vfold_cv(trainData, v=5)
+
+OJ_wf <- workflow() %>%
+  add_model(model_OJ) %>%
+  add_recipe(rec_OJ)
+
+# Modify the metrics for classification (e.g., accuracy, AUC, etc.)
+library(caret)
+classification_metrics <- metric_set(roc_auc)
+
+OJ_tune <- 
+  OJ_wf %>% 
+  tune_grid(
+    resamples = OJ_folds,
+    grid = hyper_grid,  # Use hyperparameters suitable for classification
+    metrics = classification_metrics  # Use classification metrics
+  ) 
+
+best_model <- OJ_tune %>%
+  select_best("roc_auc")
+
+best_model
+
+```
+# Best set of hyperparamater values are num_trees=667, tree_depth=1 and learning rate=0.1.
+
+**Create XGBoost model using the best hyperparameter combinations and selected variables and output the metrics**
+```{r}
+final_workflow <- 
+  OJ_wf %>% 
+  finalize_workflow(best_model)
+
+final_fit <- 
+  final_workflow %>%
+  last_fit(split = OJ_testtrn) 
+
+final_fit %>%
+  collect_metrics()
+```
+
+# Accuracy=79.5%
+# roc_auc=0.87
+# XGBoost model performance when fit on all the variables was better than using only the selected variables. 
+
+
+**Fit a Logistic Regression model using the selected variables i.e. the ones that Lasso model did not shrink to zero.**
+```{r, warning=FALSE, message=FALSE}
+glm_model2 <- glm(Purchase~DiscCH	+ LoyalCH + PriceDiff + ListPriceDiff ,data=trainData,family=binomial(link='logit'))
+summary(glm_model2)
+```
+# LoyalCH and PriceDiff are the only predictor variables that have statistically significant relationship with the target variable Purchase. Both LoyalCH and PriceDiff have a negative relationship, most significant being LoyalCH and second being PrieDiff.
+# This is also what we saw per the VIP and PDP plots of XGBoost model. Loyal CH has pretty linear negative relationship with the target variable Purchase which means that as the customer brand loyalty for CH i.e. probability of customer buying CH over MM increases, the probability of customer buying MM decreases.
+# We see that PriceDiff has a negative relationship as well which means that as the sale price of MM less sale price of CH increases, the probability of customer buying MM decreases.
+
+# We see good AIC score of 646.1. Lets see how it does on the testset.
+
+**Predict and print accuracy for Logistic Regression model2**
+```{r }
+testData$predictions <- predict(glm_model2, newdata= testData, type="response")
+testData$binary_prediction <- ifelse(testData$predictions>0.5,1,0)
+
+testData$binary_prediction <- as.factor(testData$binary_prediction)
+
+testData <- testData %>% mutate(accurate=1*(binary_prediction==Purchase))
+accuracy <- sum(testData$accurate)/nrow(testData)
+
+print(paste("Accuracy:", round(accuracy,3)))
+```
+****Confusion Matrix to calculate TPR and FPR rates for glm_model2**
+```{r }
+t(confusionMatrix(testData$binary_prediction,testData$Purchase)$table)
+confusionMatrix(testData$binary_prediction,testData$Purchase)$byClass
+```
+
+# Accuracy=80%
+# Sensitivity/Recall/TPR=82.44%
+# Specificity/True Negative Rate=76.19%
+ 
+**Create a correlation plot to check for multi-collinearity on the selected set of variables in glm_model2**
+```{r pressure, echo=FALSE}
+predictors <- OJ[, names(OJ) %in% c("DiscCH", "LoyalCH","PriceDiff", "ListPriceDiff")]
+correl <- cor(predictors)
+ggcorrplot::ggcorrplot(correl,hc.order=TRUE,type="lower",lab=TRUE)
+```
+# We do not see high multicollinearity anymore.
+
+**Check for multicollinearity using VIF for logistic regression model glm_model2**
+```{r, warning=FALSE, message=FALSE}
+library(car)
+vif_check <- car::vif(glm_model2)
+vif_check
+```
+#We see VIF values are all lower than 2. We no longer see high collinearity now.
+
+**Fitting logistic regression model using only the two significant variables**
+```{r, warning=FALSE, message=FALSE}
+glm_model3 <- glm(Purchase~LoyalCH+PriceDiff,data=trainData,family=binomial(link='logit'))
+summary(glm_model3)
+```
+# AIC is higher than glm_model2 indicating that glm_model2 fit the training data better. Lets see how it does on the testset.
+
+**Predict and print accuracy for Logistic Regression model3**
+```{r }
+testData$predictions <- predict(glm_model3, newdata= testData, type="response")
+testData$binary_prediction <- ifelse(testData$predictions>0.5,1,0)
+testData$binary_prediction <- as.factor(testData$binary_prediction)
+
+testData <- testData %>% mutate(accurate=1*(binary_prediction==Purchase))
+accuracy <- sum(testData$accurate)/nrow(testData)
+
+print(paste("Accuracy:", round(accuracy,3)))
+```
+**Confusion Matrix to calculate TPR and FPR rates for glm_model3**
+```{r }
+t(confusionMatrix(testData$binary_prediction,testData$Purchase)$table)
+confusionMatrix(testData$binary_prediction,testData$Purchase)$byClass
+```
+# Accuracy=80%
+# Sensitivity/Recall/True Positive Rate=82.44%
+# Specificity/True Negative Rate=76.19%
+
+# Sensitivity measures the proportion of actual positive cases that are correctly identified by the model. The model is able to correctly identify positive cases i.e chances of customer buying MM over CH 82% of the time.
+
+# Specificity measures the proportion of actual negative cases that are correctly identified by the model. The model is able to correctly identify negative cases i.e chances of customer buying CH over MM 76% of the time.
+
+# Accuracy, Specificity and Sensitivity values are the same for both glm_model2 and glm_model3. However, AIC score for glm_model2 is lower 646.1 for glm_model2 vs 647.02 for glm_model3. Lets check the roc_auc curve for the two models. 
+
+**Compare AUC ROC curves of the two Logistic regression models with different variables selected**
+```{r }
+library(dplyr)
+library(plotROC)
+testData$model2_prediction <- predict(glm_model2, newdata = testData, type="response")
+testData$model3_prediction <- predict(glm_model3, newdata = testData, type="response")
+#combine both predictions with the ground truth
+roc_d <- as.data.frame(cbind(testData$model2_prediction,testData$model3_prediction, testData$Purchase))
+colnames(roc_d) <- c("Model2", "Model3","ground_truth")
+basicplot1 <- ggplot(roc_d, aes(d=ground_truth, m=Model2))+geom_roc()
+basicplot2 <- ggplot(roc_d, aes(d=ground_truth, m=Model3))+geom_roc()
+
+long_roc <- melt_roc(roc_d, "ground_truth", c("Model2", "Model3"))
+
+ggplot(long_roc, aes(d=D, m=M, color=name))+
+  geom_roc() + style_roc(xlab="False Positive Rate", ylab="True Positive Rate")+
+  annotate("text", x=.75, y=.25,
+           label=paste("AUC Model2 = ", round(calc_auc(basicplot1)$AUC,2)))+
+  annotate("text", x=.75, y=.18,
+           label=paste("AUC Model3 = ", round(calc_auc(basicplot2)$AUC,2)))
+
+```
+
+# AUC score for both the two logistic regression models glm_model2 vs glm_model3 is 0.86
+# The accuracy rate of logistic regression models and XGBoost model were the same of 80% on the test data.
+# AUC score for both the two logistic regression models glm_model2 vs glm_model3 is 0.86 which is slightly lower than that of XGBoost model which is 0.87 which indicates that XGBoost model is a better performing model and is able to better distinguish positive and negative classes. 
