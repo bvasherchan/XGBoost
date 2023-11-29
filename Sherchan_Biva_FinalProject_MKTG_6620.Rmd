@@ -1,5 +1,4 @@
 ---
-title: "6620: Final Project"
 author: "Biva Sherchan"
 output:
   html_document: default
